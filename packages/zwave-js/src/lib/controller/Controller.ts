@@ -2078,6 +2078,16 @@ export class ZWaveController
 		return this._inclusionState;
 	}
 
+	/**
+	 * @internal
+	 * Tracks whether a RequestNodeNeighborUpdate operation is currently
+	 * in progress. During neighbor discovery, the target node broadcasts
+	 * its NIF which can cause the Z-Wave chip to generate a spurious
+	 * ApplicationUpdateRequest with Node_Added type. This flag allows
+	 * handleApplicationUpdateRequest to suppress that false positive.
+	 */
+	private _neighborDiscoveryActive: boolean = false;
+
 	/** @internal */
 	public setInclusionState(state: InclusionState): void {
 		if (this._inclusionState === state) return;
@@ -3786,6 +3796,19 @@ export class ZWaveController
 			// A node was included by another controller
 			const nodeId = msg.nodeId;
 			const nodeInfo = msg.nodeInformation;
+
+			// During a RequestNodeNeighborUpdate, the target node broadcasts
+			// its NIF. Nearby factory-reset nodes (or nodes on other networks)
+			// may respond with their own NIF, causing the Z-Wave chip to
+			// generate a spurious ApplicationUpdateRequest with Node_Added
+			// type. This is NOT a real inclusion — suppress it entirely.
+			if (this._neighborDiscoveryActive) {
+				this.driver.controllerLog.print(
+					`Ignoring ApplicationUpdateRequest (Node Added) for node ${nodeId} — neighbor discovery is in progress. This is likely a spurious NIF broadcast, not a real inclusion.`,
+					"warn",
+				);
+				return;
+			}
 
 			// It can happen that this is received for a node that is already part of the network:
 			// https://github.com/zwave-js/zwave-js/issues/5781
@@ -7731,24 +7754,29 @@ export class ZWaveController
 			NodeType.Controller,
 		);
 
-		const resp = await this.driver.sendMessage<
-			RequestNodeNeighborUpdateReport
-		>(
-			new RequestNodeNeighborUpdateRequest({
-				nodeId,
-				discoveryTimeout,
-			}),
-		);
-		const success =
-			resp.updateStatus === NodeNeighborUpdateStatus.UpdateDone;
+		this._neighborDiscoveryActive = true;
+		try {
+			const resp = await this.driver.sendMessage<
+				RequestNodeNeighborUpdateReport
+			>(
+				new RequestNodeNeighborUpdateRequest({
+					nodeId,
+					discoveryTimeout,
+				}),
+			);
+			const success =
+				resp.updateStatus === NodeNeighborUpdateStatus.UpdateDone;
 
-		if (success) {
-			// Not sure why, but Zniffer traces show that a node neighbor update can cause the controller to
-			// also do AssignSUCReturnRoute. As a result, we need to invalidate our route cache.
-			this.setCustomSUCReturnRoutesCached(nodeId, undefined);
+			if (success) {
+				// Not sure why, but Zniffer traces show that a node neighbor update can cause the controller to
+				// also do AssignSUCReturnRoute. As a result, we need to invalidate our route cache.
+				this.setCustomSUCReturnRoutesCached(nodeId, undefined);
+			}
+
+			return success;
+		} finally {
+			this._neighborDiscoveryActive = false;
 		}
-
-		return success;
 	}
 
 	/**
